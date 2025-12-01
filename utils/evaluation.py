@@ -3,7 +3,20 @@ import pandas as pd
 from itertools import combinations
 from sklearn.metrics import mean_pinball_loss
 
-def evaluate_model_combinations(y_true, models_dict, quantiles):
+def calculate_m5_scale(y_train):
+    """
+    Считает скейлер по методологии M5 (Mean Absolute Diff на трейне).
+    Используется для нормализации ошибки разных рядов.
+    """
+    # Берем разности соседних элементов (y_t - y_{t-1})
+    diffs = np.diff(y_train)
+    # Считаем среднее абсолютное значение
+    scale = np.mean(np.abs(diffs))
+    
+    # Защита от деления на ноль (для константных рядов)
+    return scale if scale != 0 else 1.0
+
+def evaluate_model_combinations(y_true, models_dict, quantiles, y_train=None, return_raw=False):
     """
     Сравнивает одиночные модели и их ансамбли (винцентизация) по метрике Pinball Loss.
 
@@ -16,11 +29,21 @@ def evaluate_model_combinations(y_true, models_dict, quantiles):
             Здесь ключи - имена моделей, значения - словари, где ключ - квантиль, 
             значение - массив предсказаний.
         quantiles (list): Список проверяемых квантилей (напр. [0.05, 0.5, 0.95]).
-
+        y_train: (Опционально) Обучающая выборка. Если передана,
+                 метрика будет Scaled Pinball Loss (как в M5).
+                 Если None, то обычный Pinball Loss.
+        return_raw: Если True, возвращает сырой DataFrame без стилей (для дальнейшей обработки).
     Returns:
         pd.DataFrame: Таблица с метриками (Stylized DataFrame).
     """
     
+    # 1. Расчет скейлера (если передан трейн)
+    scale = 1.0
+    
+    if y_train is not None:
+        scale = calculate_m5_scale(y_train)
+        print(f"Используется Scale: {scale:.4f}")
+
     model_names = list(models_dict.keys())
     results = {q: {} for q in quantiles}
     
@@ -58,6 +81,7 @@ def evaluate_model_combinations(y_true, models_dict, quantiles):
             
             # Считаем ошибку
             loss = mean_pinball_loss(y_true, ensemble_pred, alpha=q)
+            loss /= scale
             results[q][combo_name] = loss
             
             # Сохраняем для статистики
