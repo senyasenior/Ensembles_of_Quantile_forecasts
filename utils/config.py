@@ -34,7 +34,7 @@ class ProjectConfig:
         self.FORECAST_HORIZON = int(os.environ.get("FORECAST_HORIZON", 28))
         
         # Квантили (передаем строкой через запятую, например "0.1,0.5,0.9")
-        q_str = os.environ.get("QUANTILES", "0.05,0.25,0.5,0.75,0.95")
+        q_str = os.environ.get("QUANTILES", "0.1,0.25,0.5,0.75,0.9")
         self.QUANTILES = [float(x) for x in q_str.split(",")]
 
     def _get_input_path(self):
