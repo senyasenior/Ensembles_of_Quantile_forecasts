@@ -27,7 +27,7 @@ class PinballLoss:
     def __call__(self, target_data: torch.Tensor, predict_data: torch.Tensor):
         error_data = target_data - predict_data 
         loss_data = torch.max(self.quantiles * error_data, (self.quantiles - 1) * error_data)
-        return loss_data.mean()
+        return loss_data.sum()
 
 class QuantileAggregatorTrainer:
     def __init__(
@@ -216,10 +216,17 @@ class QuantileAggregatorTrainer:
         plt.figure(figsize=(15, 5))
         
         # Loss
-        plt.subplot(1, 2, 1)
+        plt.subplot(3, 1, 1)
         plt.plot(history['train_loss'], label='Train Pinball')
-        plt.plot(history['val_loss'], label='Val Pinball')
-        plt.title('Loss History')
+        plt.title('Train Loss History')
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+
+        plt.subplot(3, 1, 2)
+        plt.plot(history['val_loss'], color='orange', label='Val Pinball')
+        plt.title('Val Loss History')
         plt.xlabel('Epoch')
         plt.ylabel('Loss')
         plt.legend()
@@ -227,10 +234,10 @@ class QuantileAggregatorTrainer:
         
         # Metrics
         if history['metrics']:
-            plt.subplot(1, 2, 2)
+            plt.subplot(3, 1, 3)
             for name, values in history['metrics'].items():
                 plt.plot(values, label=name)
-            plt.title('Metrics History')
+            plt.title('Val Metrics History')
             plt.xlabel('Epoch')
             plt.legend()
             plt.grid(True, alpha=0.3)
