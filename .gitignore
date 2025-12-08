@@ -11,8 +11,12 @@ venv/
 
 # Jupyter
 .ipynb_checkpoints/
+notebooks/checkpoints
+notebooks/catboost_info
+notebooks/results
 
 # Generated files & Logs
 output/
 
 .python-version
+/checkpoints
