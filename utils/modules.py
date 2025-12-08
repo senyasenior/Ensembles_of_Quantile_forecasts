@@ -14,8 +14,60 @@ from sklearn.model_selection import TimeSeriesSplit
 from utils.config import cfg
 from collections import defaultdict
 from sktime.forecasting.base import BaseForecaster
+import logging
 
+# Получаем логгер cmdstanpy и ставим уровень CRITICAL (только фатальные ошибки)
+logging.getLogger('cmdstanpy').setLevel(logging.CRITICAL)
 
+# То же самое для Prophet, на всякий случай
+logging.getLogger('prophet').setLevel(logging.CRITICAL)
+
+class SktimeProductionAdapter:
+    def __init__(self, model, quantiles):
+        """
+        Адаптер для использования моделей sktime внутри UniversalQuantileAggregator.
+        
+        Args:
+            model: Обученная модель sktime (должна иметь метод predict_quantiles).
+            quantiles: Список квантилей, например [0.1, 0.5, 0.9].
+                       Важно: порядок квантилей в выходном массиве будет соответствовать
+                       порядку, в котором sktime их возвращает (обычно отсортированный).
+                       Убедитесь, что Aggregator обучен на таком же порядке.
+        """
+        self.model = model
+        self.quantiles = quantiles
+
+    def __call__(self, input_data, horizon):
+        """
+        Вызывается внутри predict_ensemble.
+        
+        Args:
+            input_data: Данные для прогноза. 
+                        Если модели нужны экзогенные переменные (X), input_data может быть:
+                        1. Словарем {'X': pd.DataFrame/np.array}
+                        2. Самим DataFrame/np.array (X)
+                        Если модель одномерная и не требует X, можно передавать None.
+            horizon (int): Горизонт прогнозирования (целое число).
+            
+        Returns:
+            np.array: Массив размера [Horizon, N_quantiles]
+        """
+        
+        fh = np.arange(1, horizon + 1)
+
+        # Обработка входных данных (Exogenous variables)
+        X = None
+        if input_data is not None:
+            if isinstance(input_data, dict) and 'X' in input_data:
+                # Если передан словарь с ключом 'X'
+                X = input_data['X']
+            else:
+                # Если передано что-то другое, считаем это X
+                X = input_data
+
+        
+        pred_df = self.model.predict_quantiles(fh=fh, X=X, alpha=self.quantiles)
+        return pred_df.values
 
 class PinballLoss:
     def __init__(
@@ -538,12 +590,15 @@ class TimeSeriesAggregatorPipeline:
         # Словарь OOF предсказаний моделей для обучения агрегатора и агрегации
         models_oof_data = defaultdict(dict)
 
+        #callable объекты для предсказания квантилей в продакшне
+        
+
         print(f"Запуск OOF генерации ({n_splits} splits)...")
         
         # Прогресс бар по фолдам
         # for model_name, factory in model_factories.items():
         #     model = 
-        for train_idx, val_idx in tqdm(tscv.split(y), "FOLD", position=0, total=n_splits):
+        for i_fold, (train_idx, val_idx) in enumerate(tqdm(tscv.split(y), "FOLD", position=0, total=n_splits)):
             
             # 1. Разбиение данных
             # Для временных рядов train_idx всегда идут ДО val_idx
@@ -567,6 +622,7 @@ class TimeSeriesAggregatorPipeline:
                 model = factory()
                 
                 # Обучаем на прошлом
+                
                 model.fit(y=y_tr, X=X_tr)
                             
                 for start_step in range(0, len(y_val), cfg.FORECAST_HORIZON):
@@ -583,6 +639,8 @@ class TimeSeriesAggregatorPipeline:
                 current_model_quantile_preds = np.concatenate(current_model_quantile_preds, axis=0)
                 current_fold_quantile_preds.append(current_model_quantile_preds)
             
+            
+            
             # Склеиваем модели: [N_val, 1, Q] -> [N_val, N_models, Q]
             # stack по оси 1
             fold_quantile_preds_np = np.stack(current_fold_quantile_preds, axis=1)
@@ -596,7 +654,7 @@ class TimeSeriesAggregatorPipeline:
         print(f"OOF генерация завершена.")
         print(f"Исходный размер: {len(y)}")
         print(f"Размер для агрегации (без первого трейн-куска): {len(y_aligned)}")
-        print(f"Размер квантильных прогнозов: {oof_quantile_preds_full.shape}")
+        print(f"Размер квантильных прогнозов: {oof_quantile_preds_full.shape}\n")
         
         for model_idx, model_name in enumerate(model_factories):
             for q_idx, q in enumerate(cfg.QUANTILES):
