@@ -14,13 +14,6 @@ from sklearn.model_selection import TimeSeriesSplit
 from utils.config import cfg
 from collections import defaultdict
 from sktime.forecasting.base import BaseForecaster
-import logging
-
-# Получаем логгер cmdstanpy и ставим уровень CRITICAL (только фатальные ошибки)
-logging.getLogger('cmdstanpy').setLevel(logging.CRITICAL)
-
-# То же самое для Prophet, на всякий случай
-logging.getLogger('prophet').setLevel(logging.CRITICAL)
 
 class SktimeProductionAdapter:
     def __init__(self, model, quantiles):
@@ -623,7 +616,9 @@ class TimeSeriesAggregatorPipeline:
                 
                 # Обучаем на прошлом
                 
-                model.fit(y=y_tr, X=X_tr)
+                if X_tr is not None:
+                    model.fit(y=y_tr, X=X_tr)
+                else: model.fit(y=y_tr)
                             
                 for start_step in range(0, len(y_val), cfg.FORECAST_HORIZON):
                     end_step = min(start_step + cfg.FORECAST_HORIZON, len(y_val))
