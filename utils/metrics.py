@@ -1,5 +1,6 @@
 import numpy as np
 import pandas as pd
+from collections import defaultdict
 
 def calculate_scale(y_train):
     """
@@ -35,6 +36,10 @@ def prediction_interval_coverage(y_true, y_lower, y_upper):
     hits = (y_true >= y_lower) & (y_true <= y_upper)
     return np.mean(hits)
 
+def prediction_quantile_coverage(y_true: np.ndarray, quantiles: np.ndarray):
+    """расчитывает процент попадания истинных значеинй ниже предсказанного квантиля (PQCP)"""
+    return (y_true <= quantiles).mean()
+
 def prediction_interval_width(y_lower, y_upper):
     """
     Рассчитывает среднюю ширину интервала (MPIW).
@@ -58,7 +63,7 @@ def evaluate_metrics(y_true, y_preds, quantiles, scale=1.0):
     y_preds = np.array(y_preds)
     quantiles = np.array(quantiles)
     
-    metrics = {}
+    metrics = defaultdict(dict)
     
     # 1. Pinball Loss & WIS
     # WIS ≈ 2 * Mean(Pinball Loss) over all quantiles
@@ -82,6 +87,9 @@ def evaluate_metrics(y_true, y_preds, quantiles, scale=1.0):
         # Calibration (ACE - Average Calibration Error)
         cov = np.mean(y_true <= q_pred)
         observed_coverage.append(cov)
+        metrics["ACE"][q] = cov
+
+
 
     avg_pinball_scaled = total_pinball / len(quantiles)
     metrics['WIS'] = 2 * avg_pinball_scaled # По формуле из статьи
