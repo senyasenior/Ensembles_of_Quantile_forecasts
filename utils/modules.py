@@ -8,12 +8,16 @@ import matplotlib.pyplot as plt
 import os
 
 import time
+import pandas as pd
+from catboost import CatBoostRegressor
 from tqdm.auto import tqdm
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import TimeSeriesSplit
 from utils.config import cfg
 from collections import defaultdict
 from sktime.forecasting.base import BaseForecaster
+from statsmodels.tsa.stattools import adfuller
+import warnings
 
 class SktimeProductionAdapter:
     def __init__(self, model, quantiles):
@@ -62,6 +66,349 @@ class SktimeProductionAdapter:
         pred_df = self.model.predict_quantiles(fh=fh, X=X, alpha=self.quantiles)
         return pred_df.values
 
+
+class CatBoostRecursiveWrapper:
+    def __init__(self, 
+                 quantiles, 
+                 lags, 
+                 rolling_windows, 
+                 diff_periods, 
+                 val_size=None,
+                 log_transform=False,
+                 auto_diff=False,        
+                 max_diff_order=2,       
+                 adf_p_value=0.05,       
+                 **catboost_params):
+        
+        self.quantiles = sorted(quantiles)
+        self.lags = lags
+        self.rolling_windows = rolling_windows
+        self.diff_periods = diff_periods
+        self.val_size = val_size
+        
+        # Настройки предобработки
+        self.log_transform = log_transform
+        self.auto_diff = auto_diff
+        self.max_diff_order = max_diff_order
+        self.adf_p_value = adf_p_value
+        
+        # Внутреннее состояние
+        self.diff_order_ = 0       
+        self.last_values_ = []     
+        self.history = None        # История (уже трансформированная и стационарная!)
+        self.model = None
+        
+        # CatBoost init
+        self.catboost_params = catboost_params
+        q_str = ",".join([str(q) for q in self.quantiles])
+        self.loss_function = f'MultiQuantile:alpha={q_str}'
+        
+        if 0.5 in self.quantiles:
+            self.median_idx = self.quantiles.index(0.5)
+        else:
+            self.median_idx = len(self.quantiles) // 2
+
+    def _check_stationarity(self, series):
+        """Проверяет ряд на стационарность через Augmented Dickey-Fuller test."""
+        # ADF требует определенной длины, если ряд короткий - пропускаем
+        if len(series) < 10:
+            return True 
+            
+        try:
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore")
+                result = adfuller(series)
+            return result[1] < self.adf_p_value
+        except:
+            return False # Если тест упал, считаем нестационарным
+
+    def _transform(self, y, mode='fit'):
+        """
+        Применяет Log -> Diff (iterative).
+        mode='fit': определяет порядок d и сохраняет якоря.
+        mode='update': использует сохраненный d и обновляет якоря.
+        """
+        y_trans = np.array(y, dtype=float)
+        
+        # 1. Log Transform
+        if self.log_transform:
+            y_trans = np.log1p(y_trans)
+            
+        # 2. Auto Differencing
+        if self.auto_diff:
+            if mode == 'fit':
+                self.diff_order_ = 0
+                self.last_values_ = [] # Стек последних значений для каждого уровня diff
+                
+                # Итеративно дифференцируем
+                current_series = y_trans.copy()
+                
+                for d in range(self.max_diff_order):
+                    # Проверка
+                    if self._check_stationarity(current_series):
+                        break
+                    
+                    # Сохраняем последнее значение ПЕРЕД дифференцированием (якорь для восстановления)
+                    self.last_values_.append(current_series[-1])
+                    
+                    # Применяем diff
+                    current_series = np.diff(current_series)
+                    self.diff_order_ += 1
+                    
+                y_trans = current_series
+                
+            elif mode == 'update':
+                # При update мы просто применяем УЖЕ ВЫУЧЕННЫЙ порядок diff
+                # И обновляем якоря, чтобы прогноз шел от конца новых данных
+                
+                # Нам нужно сохранить последние значения для восстановления БУДУЩЕГО прогноза.
+                # Поэтому мы должны "прогнать" новые данные через процесс и обновить self.last_values_
+                
+                # Сложность: last_values_ должны быть "последними известными абсолютными значениями"
+                # на конец всего ряда (старая история + новая).
+                
+                # Восстанавливаем полную картину (или берем хвост, если он длинный)
+                # Проще всего: при update мы обновляем last_values_ глядя на "сырой" y (после логарифма)
+                
+                temp_series = y_trans.copy() # Это уже логарифмированные данные
+                
+                # Обновляем якоря
+                # Якорь уровня 0 = последнее значение ряда
+                # Якорь уровня 1 = последнее значение diff(ряда)
+                # ...
+                new_anchors = []
+                for _ in range(self.diff_order_):
+                    new_anchors.append(temp_series[-1])
+                    temp_series = np.diff(temp_series)
+                
+                self.last_values_ = new_anchors
+                
+                # Результат трансформации для дообучения
+                y_trans = np.diff(y_trans, n=self.diff_order_)
+
+        return y_trans
+
+    def _inverse_transform(self, preds_matrix, horizon):
+        """
+        Восстанавливает прогноз: Cumsum (d раз) -> Expm1.
+        preds_matrix: [Horizon, Quantiles] - это предсказанные ИЗМЕНЕНИЯ.
+        """
+        preds_restored = preds_matrix.copy()
+        
+        # 1. Inverse Diff (идем с конца: от d-го порядка к 0-му)
+        if self.auto_diff and self.diff_order_ > 0:
+            # last_values_ хранит [val_d0, val_d1, ...]
+            # Нам нужно применять их в обратном порядке: сначала восстановить d-1 из d, потом d-2...
+            
+            # Пример: d=1. preds - это diffs.
+            # restored = cumsum(preds) + last_val
+            
+            for d in reversed(range(self.diff_order_)):
+                anchor = self.last_values_[d]
+                # Cumsum по оси времени (axis=0)
+                preds_restored = np.cumsum(preds_restored, axis=0) + anchor
+        
+        # 2. Inverse Log
+        if self.log_transform:
+            preds_restored = np.expm1(preds_restored)
+            
+        return preds_restored
+
+    def _generate_features(self, y_data):
+        # ... (стандартная генерация фичей без изменений) ...
+        # Копируем из предыдущего ответа
+        if not isinstance(y_data, pd.Series):
+            if isinstance(y_data, np.ndarray):
+                df = pd.DataFrame({'target': y_data})
+            else:
+                df = pd.DataFrame({'target': y_data})
+        else:
+            df = pd.DataFrame({'target': y_data.values}, index=y_data.index)
+            
+        # Тренд (важен!)
+        df['trend_idx'] = np.arange(len(df))
+        
+        for lag in self.lags:
+            df[f'lag_{lag}'] = df['target'].shift(lag)
+
+        base_col = df['target'].shift(1)
+        for window in self.rolling_windows:
+            df[f'rolling_mean_{window}'] = base_col.rolling(window=window).mean()
+            df[f'rolling_std_{window}'] = base_col.rolling(window=window).std()
+
+        for period in self.diff_periods:
+            df[f'diff_{period}'] = df['target'].diff(period)
+
+        df = df.dropna()
+        y = df['target']
+        X = df.drop(columns=['target'])
+        return X, y
+
+    def fit(self, y, X=None):
+        # 1. Трансформация (Log + AutoDiff)
+        # fit определяет self.diff_order_ и заполняет self.last_values_
+        y_trans = self._transform(y, mode='fit')
+        
+        # Сохраняем ИСТОРИЮ в стационарном виде для генерации фичей
+        self.history = list(y_trans)
+        
+        # 2. Генерация фичей на стационарном ряде
+        X_full, y_full = self._generate_features(pd.Series(y_trans))
+        
+        # 3. Параметры
+        params = {
+            'iterations': 1000,
+            'verbose': 0,
+            'allow_writing_files': False,
+            'random_state': 42,
+            'task_type': "CPU"
+        }
+        params.update(self.catboost_params)
+        params['loss_function'] = self.loss_function
+        
+        # 4. Train/Eval Split
+        eval_set = None
+        if self.val_size and self.val_size > 0:
+            if len(X_full) <= self.val_size:
+                X_train, y_train = X_full, y_full
+            else:
+                X_train = X_full.iloc[:-self.val_size]
+                y_train = y_full.iloc[:-self.val_size]
+                X_eval = X_full.iloc[-self.val_size:]
+                y_eval = y_full.iloc[-self.val_size:]
+                eval_set = (X_eval, y_eval)
+        else:
+            X_train, y_train = X_full, y_full
+
+        # 5. Обучение
+        self.model = CatBoostRegressor(**params)
+        self.model.fit(X_train, y_train, eval_set=eval_set)
+        
+        # Вывод информации о трансформации (для отладки)
+        # print(f"Diff Order: {self.diff_order_}, Log: {self.log_transform}")
+        
+        return self
+
+    def predict_quantiles(self, fh, X=None, alpha=None) -> pd.DataFrame:
+        horizon = fh if isinstance(fh, int) else len(fh)
+        
+        # Рекурсия идет на СТАЦИОНАРНЫХ данных
+        current_history = self.history.copy()
+        future_preds_stationary = []
+        
+        max_lookback = 0
+        if self.lags: max_lookback = max(max_lookback, max(self.lags))
+        if self.rolling_windows: max_lookback = max(max_lookback, max(self.rolling_windows))
+        if self.diff_periods: max_lookback = max(max_lookback, max(self.diff_periods))
+        max_lookback += 5 
+        
+        for _ in range(horizon):
+            recent_history = current_history[-max_lookback:]
+            temp_hist = recent_history + [0] 
+            
+            # Генерация фичей (на стационарном ряде)
+            X_temp, _ = self._generate_features(pd.Series(temp_hist))
+            
+            if X_temp.empty: raise ValueError("Not enough history")
+            X_next = X_temp.iloc[[-1]]
+            
+            # Коррекция trend_idx для стационарного ряда (он продолжает расти)
+            X_next = X_next.copy()
+            X_next['trend_idx'] = len(current_history)
+            
+            # Предсказание (это изменения/diffs, если d>0)
+            pred_q = self.model.predict(X_next)
+            future_preds_stationary.append(pred_q[0])
+            
+            # Рекурсия через медиану
+            pred_median = pred_q[0, self.median_idx]
+            current_history.append(pred_median)
+            
+        # --- ВОССТАНОВЛЕНИЕ (Inverse Transform) ---
+        preds_matrix = np.array(future_preds_stationary)
+        
+        # Здесь мы используем self.last_values_, которые были сохранены в fit() или update()
+        # Они содержат абсолютные значения на КОНЕЦ обучающей выборки.
+        # Это позволяет корректно приклеить cumsum к концу трейна.
+        final_preds = self._inverse_transform(preds_matrix, horizon)
+        
+        # Индексы
+        if hasattr(fh, '__iter__'):
+            index = fh
+        else:
+            index = np.arange(1, horizon + 1)
+            
+        return pd.DataFrame(final_preds, index=index, columns=self.quantiles)
+
+    def update(self, y_new, X_new=None, update_params=True):
+        # 1. Сначала обновляем self.last_values_ и получаем стационарный кусок
+        # Важно: нам нужно передать 'update' в transform, чтобы он использовал старый d
+        # и обновил якоря. Но _transform ожидает на вход ВЕСЬ ряд или кусок?
+        # В нашей логике update_anchors требует контекста.
+        
+        # Проще всего: Склеить старую "сырую" историю (которой у нас нет, мы храним stationary)
+        # А, мы не храним сырую историю. Это проблема для update якорей.
+        
+        # РЕШЕНИЕ: При update мы должны подавать "сырые" y_new.
+        # Но чтобы обновить якорь (последнее значение тренда), нам нужно последнее значение
+        # предыдущего куска.
+        # self.last_values_ уже содержит последнее значение предыдущего куска (anchor).
+        
+        # Давайте обновим last_values_ "на лету", проходя по y_new
+        y_values = np.array(y_new, dtype=float)
+        if self.log_transform:
+            y_values = np.log1p(y_values)
+            
+        # Обновление якорей
+        # Если d=1, то новый якорь = последнее значение y_new
+        # Если d=2, то новый якорь[0] = последнее y_new
+        #           новый якорь[1] = последнее diff(y_new)
+        
+        # Но сначала нам нужно превратить y_new в стационарный вид для обучения модели
+        # Для этого нужно знать "стык" между старой историей и y_new.
+        # Стыки лежат в self.last_values_.
+        
+        y_trans = y_values.copy()
+        
+        # Итеративное дифференцирование с учетом стыка
+        # Для d=0..max:
+        #   y_diff = y[t] - y[t-1].
+        #   Для первого элемента y_new[0] нам нужно prev_last_value.
+        
+        new_anchors = []
+        
+        for d in range(self.diff_order_):
+            prev_anchor = self.last_values_[d]
+            
+            # Сохраняем новый якорь для этого уровня (последнее значение ТЕКУЩЕГО ряда)
+            new_anchors.append(y_trans[-1])
+            
+            # Дифференцируем y_trans
+            # np.diff теряет 1 элемент. Но у нас есть prev_anchor!
+            # diff[0] = y_trans[0] - prev_anchor
+            # diff[1..] = np.diff(y_trans)
+            
+            first_diff = y_trans[0] - prev_anchor
+            rest_diff = np.diff(y_trans)
+            y_trans = np.concatenate([[first_diff], rest_diff])
+            
+        # Обновляем якоря класса на новые (теперь они указывают на конец y_new)
+        if self.diff_order_ > 0:
+            self.last_values_ = new_anchors
+            
+        # Добавляем стационарный кусок в историю
+        self.history.extend(list(y_trans))
+        
+        # Дообучение
+        if update_params:
+            # Генерируем фичи на (теперь увеличенной) стационарной истории
+            # Берем окно для скорости
+            X_tr, y_tr = self._generate_features(pd.Series(self.history[-2000:])) # Пример окна
+            self.model.fit(X_tr, y_tr, init_model=self.model)
+            
+        return self
+
+
 class PinballLoss:
     def __init__(
             self,
@@ -74,15 +421,116 @@ class PinballLoss:
         loss_data = torch.max(self.quantiles * error_data, (self.quantiles - 1) * error_data)
         return loss_data.sum()
 
+def calculate_adaptive_margins(y_true, models_oof: np.ndarray, quantiles, scale_factor=0.1):
+    """
+    Реализация формулы для расчета адаптивных margin'ов.
+    
+    Args:
+        y_true: Истинные значения OOF [N_samples]
+        models_oof: Словарь или массив прогнозов. 
+                    Нужно достать прогнозы для МЕДИАНЫ (0.5).
+        quantiles: Список всех квантилей.
+    """
+    # 1. Pilot Estimator (g_hat_0)
+    
+    if 0.5 not in quantiles:
+        raise ValueError("Для метода из в списке квантилей должна быть медиана (0.5)")
+    
+    med_idx = quantiles.index(0.5)
+    
+    median_preds = models_oof[:, :, med_idx] 
+    g0 = np.mean(median_preds, axis=1)
+        
+    # 2. Residuals (R_i)
+    residuals = y_true - g0
+    
+    # 3. Расчет margins 
+    margins = []
+    
+
+    residual_quantiles_values = np.quantile(residuals, quantiles)
+    res_q_map = dict(zip(quantiles, residual_quantiles_values))
+    
+    # Идем по парам соседних квантилей (tau, tau')
+    for i in range(len(quantiles) - 1):
+        tau = quantiles[i]
+        tau_prime = quantiles[i+1]
+        
+        # Gap = Q_tau'(R) - Q_tau(R)
+        gap = res_q_map[tau_prime] - res_q_map[tau]
+        
+        #delta = delta_0 * (gap)+
+        margin_val = scale_factor * max(0, gap)
+        margins.append(margin_val)
+        
+    return torch.tensor(margins, dtype=torch.float32)
+
+class PenalizedPinballLoss:
+    def __init__(
+        self, 
+        quantiles=None,       
+        penalty_weight=0.0,   
+        margins=None          
+    ):
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        
+        q_list = quantiles if quantiles is not None else cfg.QUANTILES
+        self.quantiles = torch.tensor(q_list, dtype=torch.float32, device=device)
+        
+        self.penalty_weight = penalty_weight
+        
+        if margins is not None:
+            if not isinstance(margins, torch.Tensor):
+                self.margins = torch.tensor(margins, dtype=torch.float32, device=device)
+            else:
+                self.margins = margins.to(device)
+        else:
+            self.margins = None
+
+    def __call__(self, predict_data: torch.Tensor, target_data: torch.Tensor):
+        """
+        predict_data: [Batch, N_quantiles]
+        target_data: [Batch, 1] (или [Batch])
+        """
+        if self.quantiles.device != predict_data.device:
+            self.quantiles = self.quantiles.to(predict_data.device)
+        
+        # --- 1. Основной Pinball Loss (Ваш код) ---
+        if target_data.dim() == 1:
+            target_data = target_data.view(-1, 1)
+            
+        error_data = target_data - predict_data 
+        loss_data = torch.max(self.quantiles * error_data, (self.quantiles - 1) * error_data)
+        total_pinball = loss_data.sum()
+        
+        # --- 2. Crossing Penalty (Штраф за пересечение/сближение) ---
+        if self.penalty_weight > 0:
+
+            diffs = predict_data[:, 1:] - predict_data[:, :-1]
+            
+            if self.margins is not None:
+                if self.margins.device != predict_data.device:
+                    self.margins = self.margins.to(predict_data.device)
+                penalty_terms = torch.relu(self.margins - diffs)
+            else:
+                penalty_terms = torch.relu(-diffs)
+            
+            crossing_loss = penalty_terms.sum()
+            
+            return total_pinball + self.penalty_weight * crossing_loss
+            
+        return total_pinball
+
+
 class QuantileAggregatorTrainer:
     def __init__(
         self,
         model: nn.Module,
         optimizer: torch.optim.Optimizer,
-        criterion: Callable, # PinballLoss
+        criterion: Callable, # PinballLoss | PenalizedPinballLoss
         device: torch.device = 'cuda' if torch.cuda.is_available() else 'cpu',
-        compile_model: bool = False, # torch.compile иногда ломается на einsum/embedding
-        enable_amp: bool = False,     # AMP может быть нестабилен для квантилей (fp16)
+        compile_model: bool = False, 
+        enable_amp: bool = False,     
         checkpoint_dir: str = 'checkpoints'
     ):
         """
@@ -608,7 +1056,6 @@ class TimeSeriesAggregatorPipeline:
             current_fold_quantile_preds = []
             
             for model_name, factory in tqdm(model_factories.items(), "Model", leave=False, total=len(model_factories)):
-                print(model_name)
                 current_model_quantile_preds = []
 
                 # 2. Обучение и прогноз базовой модели
@@ -653,7 +1100,7 @@ class TimeSeriesAggregatorPipeline:
         
         for model_idx, model_name in enumerate(model_factories):
             for q_idx, q in enumerate(cfg.QUANTILES):
-                models_oof_data[model_name][q] = oof_quantile_preds_full[:, model_idx, q_idx]
+                models_oof_data[model_name][q] = oof_quantile_preds_full[:, model_idx, q_idx].tolist()
 
         return models_oof_data, oof_quantile_preds_full, y_aligned
 
@@ -661,6 +1108,7 @@ class TimeSeriesAggregatorPipeline:
                          oof_preds, 
                          y_true, 
                          aggregator_params: dict,
+                         criterion: PinballLoss|PenalizedPinballLoss, 
                          batch_size=256, 
                          epochs=50,
                          lr=1e-3):
@@ -668,12 +1116,10 @@ class TimeSeriesAggregatorPipeline:
         Обучение UniversalQuantileAggregator на OOF прогнозах.
         """
         assert oof_preds.shape[2] == len(cfg.QUANTILES), "oof_preds 2 dimension size should be equal to quantiles in config"
-        # 1. Стандартизация таргета (как в статье)
-        # Важно фитить скалер только на том, на чем учим агрегатор
+        assert isinstance(criterion, PenalizedPinballLoss) or isinstance(criterion, PinballLoss),\
+        f"critreion must be an istance of PinballLoss or PenalizedPinballLoss. {type(criterion)} given"
+        
         split_idx = int(len(y_true) * 0.8)
-        # self.scaler_y.fit(y_true[:split_idx][:, None])
-        # y_scaled = self.scaler_y.fit_transform(y_true.reshape(-1, 1)).flatten()
-        # y_scaled = self.scaler_y.transform(y_true.reshape(-1, 1)).flatten()
         y_scaled = y_true
         
         # 2. Подготовка тензоров
@@ -703,7 +1149,6 @@ class TimeSeriesAggregatorPipeline:
         
         # 4. Тренер
         optimizer = torch.optim.Adam(aggregator.parameters(), lr=lr)
-        criterion = PinballLoss() # Убедитесь, что PinballLoss доступен
         
         trainer = QuantileAggregatorTrainer(
             model=aggregator,
@@ -713,7 +1158,7 @@ class TimeSeriesAggregatorPipeline:
         )
         
         # 5. Обучение
-        history = trainer.fit(train_loader, val_loader, epochs=epochs, early_stopping=15)
+        history = trainer.fit(train_loader, val_loader, epochs=epochs, early_stopping=100)
         
         return aggregator, history, trainer
 

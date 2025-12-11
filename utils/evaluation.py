@@ -5,9 +5,10 @@ from torch.utils.data import TensorDataset, DataLoader
 from itertools import combinations
 from sklearn.metrics import mean_pinball_loss
 from utils.metrics import calculate_scale, evaluate_metrics
-from utils.modules import UniversalQuantileAggregator, QuantileAggregatorTrainer, PinballLoss 
-
-
+from utils.modules import UniversalQuantileAggregator, QuantileAggregatorTrainer, PinballLoss, PenalizedPinballLoss
+from utils.config import cfg
+import time
+import os
 
 
 def evaluate_model_combinations(y_true, models_dict, quantiles, y_train=None, return_raw=False):
@@ -132,6 +133,7 @@ def evaluate_model_combinations(y_true, models_dict, quantiles, y_train=None, re
 
     return df.style.apply(highlight_min, axis=1).format("{:.4f}")
 
+
 def prepare_tensors_from_dict(models_dict, combo_names, quantiles, y_true, series_ids=None):
     """
     Преобразует словарь предсказаний в тензоры PyTorch для агрегатора.
@@ -169,12 +171,14 @@ def prepare_tensors_from_dict(models_dict, combo_names, quantiles, y_true, serie
         
     return X_tensor, y_tensor, context_tensor
 
+
 def train_and_predict_aggregator(
     X_train, y_train, c_train,  # OOF данные (Train)
     X_test, c_test,             # TEST данные (Predict)
     agg_config, 
     n_models, 
-    quantiles, 
+    quantiles,
+    criterion: PinballLoss|PenalizedPinballLoss, 
     device='cpu',
     epochs=30
 ):
@@ -211,7 +215,6 @@ def train_and_predict_aggregator(
     
     # 3. Обучение
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-    criterion = PinballLoss()
     
     trainer = QuantileAggregatorTrainer(
         model, optimizer, criterion, device, 
@@ -219,9 +222,11 @@ def train_and_predict_aggregator(
     )
     
     # verbose=False, чтобы не засорять вывод в цикле комбинаций
-    trainer.fit(train_loader, val_loader, epochs=epochs, early_stopping=100)
-    
+    start_time = time.time()
+    trainer.fit(train_loader, val_loader, epochs=epochs, early_stopping=200)
+    train_agg_time = time.time() - start_time
     # 4. Предсказание (Логика predict_ensemble)
+    start_time = time.time()
     model.eval()
     with torch.no_grad():
         X_test = X_test.to(device)
@@ -233,20 +238,21 @@ def train_and_predict_aggregator(
         # так как мы подаем сразу весь батч
         preds_tensor = model(X_test, c_test)
         
-        # Б. Post-processing (Sort) - КАК В СТАТЬЕ
-        # Это ключевой момент из predict_ensemble
+        # Б. Post-processing (Sort)
         preds_tensor, _ = torch.sort(preds_tensor, dim=1)
         
         final_preds = preds_tensor.cpu().numpy()
+    pred_agg_time = time.time() - start_time
         
-    return final_preds
+    return final_preds, train_agg_time, pred_agg_time
 
 def evaluate_model_combinations_advanced(
     y_test,                 
     models_test_dict,       
     y_oof,                  
     models_oof_dict,        
-    quantiles, 
+    quantiles,
+    criterion: PinballLoss|PenalizedPinballLoss,
     y_train_hist=None,      
     aggregator_configs=[
         {'weighting_type': 'global', 'resolution': 'coarse'},
@@ -256,7 +262,7 @@ def evaluate_model_combinations_advanced(
     series_ids_oof=None,    
     series_ids_test=None,   
     device='cpu',
-    metric_mode='WIS' # <--- НОВЫЙ АРГУМЕНТ: 'WIS' или 'Pinball'
+    metric_mode='WIS' # 'WIS' | 'Pinball' | "FULL"
 ):
     """
     Сравнивает модели, их комбинации и агрегаторы.
@@ -282,24 +288,31 @@ def evaluate_model_combinations_advanced(
     long_results = []
     
     # Вспомогательная функция для расчета и сохранения метрик
-    def process_metrics(y_true, y_pred, name, method):
+    def process_metrics(y_true, y_pred, name, method, train_agg_time: float=0., pred_agg_time: float=0.):
         # 1. Считаем общий WIS
         metrics = evaluate_metrics(y_true, y_pred, quantiles, scale)
+
         long_results.append({
             'Model': name, 'Method': method, 'Metric': 'WIS', 'Value': metrics['WIS']
         })
+        long_results.append({
+            'Model': name, 'Method': method, 'Metric': 'MACE', 'Value': metrics['MACE']
+        })
+        long_results.append({
+            'Model': name, 'Method': method, 'Metric': 'TrainTime', 'Value': train_agg_time
+        })
+        long_results.append({
+            'Model': name, 'Method': method, 'Metric': 'PredTime', 'Value': pred_agg_time
+        })
         
         # 2. Считаем Pinball Loss для каждого квантиля отдельно
-        # L(q) = mean(max(q*e, (q-1)*e)) / scale
-        residuals = y_true.reshape(-1, 1) - y_pred
         for i, q in enumerate(quantiles):
-            loss = np.maximum(q * residuals[:, i], (q - 1) * residuals[:, i])
-            mean_loss_scaled = np.mean(loss) / scale
+            mean_loss_scaled = mean_pinball_loss(y_true, y_pred[:, i], alpha=q) / scale
             
             long_results.append({
                 'Model': name, 
                 'Method': method, 
-                'Metric': f'q_{q}', # Метка для столбца
+                'Metric': f'Pinball_q_{q}',
                 'Value': mean_loss_scaled
             })
 
@@ -332,57 +345,28 @@ def evaluate_model_combinations_advanced(
                 for conf in aggregator_configs:
                     agg_name = f"Agg_{conf['weighting_type']}-{conf['resolution']}"
                     try:
-                        agg_preds = train_and_predict_aggregator(
+                        agg_preds, train_agg_time, pred_agg_time = train_and_predict_aggregator(
                             X_train_t, y_train_t, c_train_t,
                             X_test_t, c_test_t,
                             agg_config=conf,
                             n_models=len(combo),
                             quantiles=quantiles,
+                            criterion=criterion,
                             device=device,
                             epochs=epochs
                         )
-                        process_metrics(y_test, agg_preds, combo_name, agg_name)
+                        process_metrics(y_test, agg_preds, combo_name, agg_name, train_agg_time, pred_agg_time)
                         
                     except Exception as e:
                         print(f"Error training {agg_name} for {combo_name}: {e}")
+                        raise e
+            else:
+                for conf in aggregator_configs:
+                    agg_name = f"Agg_{conf['weighting_type']}-{conf['resolution']}"
+                    process_metrics(y_test, vinc_preds, combo_name, agg_name)
+            
 
     # --- ФОРМИРОВАНИЕ ОТЧЕТА ---
-    if not long_results:
-        return pd.DataFrame()
-
-    df_long = pd.DataFrame(long_results)
-    
-    # Логика отображения в зависимости от режима
-    if metric_mode == 'WIS':
-        # Фильтруем только WIS
-        df_wis = df_long[df_long['Metric'] == 'WIS']
-        pivot_table = df_wis.pivot(index='Model', columns='Method', values='Value')
-        # Сортируем по качеству Vincentization
-        # pivot_table = pivot_table.sort_values(by='Vincentization')
-        print("\n=== FINAL RESULTS (Weighted Interval Score) ===")
-        
-    elif metric_mode == 'Pinball':
-        # Фильтруем все квантили (исключаем WIS)
-        df_pin = df_long[df_long['Metric'] != 'WIS']
-        
-        # Строим MultiIndex колонки: Method -> Metric (Quantile)
-        # Это создаст таблицу: 
-        #           | Vincentization      | Agg_global-coarse   | ...
-        # Model     | q_0.1 | q_0.5 | ... | q_0.1 | q_0.5 | ... |
-        pivot_table = df_pin.pivot(index='Model', columns=['Method', 'Metric'], values='Value')
-        
-        # Сортируем строки по сумме ошибок (или по медиане Vincentization)
-        # Для простоты сортируем по индексу или можно посчитать среднее
-        # pivot_table = pivot_table.sort_index()
-        print("\n=== FINAL RESULTS (Pinball Loss per Quantile) ===")
-        
-    else:
-        raise ValueError("metric_mode must be 'WIS' or 'Pinball'")
-
-    # Стилизация (подсветка минимума в каждой строке)
-    # Для MultiIndex 'Pinball' режима нам нужно подсвечивать минимум 
-    # среди методов ДЛЯ КАЖДОГО квантиля отдельно.
-    
     def highlight_min(s):
         # Если режим Pinball, у нас мультииндекс в колонках. 
         # Pandas apply(axis=1) идет по строкам. s - это строка.
@@ -406,5 +390,56 @@ def evaluate_model_combinations_advanced(
             # Обычный режим WIS
             is_min = s == s.min()
             return ['background-color: #4ef048; font-weight: bold' if v else '' for v in is_min]
+    
+    def highlight_min_in_column(s):
+        """
+        Принимает pd.Series (столбец), возвращает список стилей.
+        """
+        # s.min() находит минимальное значение в этом столбце
+        is_min = s == s.min()
+        return ['background-color: #4ef048; font-weight: bold' if v else '' for v in is_min]
+
+    if not long_results:
+        return pd.DataFrame()
+
+    df_long = pd.DataFrame(long_results)
+    
+
+    
+    # Логика отображения в зависимости от режима
+    if metric_mode == 'WIS':
+        # Фильтруем только WIS
+        df_wis = df_long[df_long['Metric'] == 'WIS']
+        pivot_table = df_wis.pivot(index=["Method"], columns='Model', values='Value')
+        # Сортируем по качеству Vincentization
+        # pivot_table = pivot_table.sort_values(by='Vincentization')
+        print("\n=== FINAL RESULTS (Weighted Interval Score) ===")
+        
+    elif metric_mode == 'Pinball':
+        # Фильтруем все квантили (исключаем WIS)
+        df_pin = df_long[df_long['Metric'].str.contains('Pinball')]
+        
+        # Строим MultiIndex колонки: Method -> Metric (Quantile)
+        # Это создаст таблицу: 
+        #           | Vincentization      | Agg_global-coarse   | ...
+        # Model     | q_0.1 | q_0.5 | ... | q_0.1 | q_0.5 | ... |
+        pivot_table = df_pin.pivot(index='Model', columns=['Method', 'Metric'], values='Value')
+        
+        # Сортируем строки по сумме ошибок (или по медиане Vincentization)
+        # Для простоты сортируем по индексу или можно посчитать среднее
+        # pivot_table = pivot_table.sort_index()
+        print("\n=== FINAL RESULTS (Pinball Loss per Quantile) ===")
+    
+    elif metric_mode == "FULL":
+        
+        pivot_table = df_long.pivot(index=['Method', 'Model'], columns="Metric", values="Value")
+        styled_table = pivot_table.style.apply(highlight_min_in_column, axis=0).format("{:.4f}")
+
+        pivot_table.to_csv(os.path.join(cfg.OUTPUT_DIR, "aggregation_results",f'{cfg.SERIES_TYPE}_{cfg.SERIES_ID}_full.csv'), index=True)
+        styled_table.to_html(os.path.join(cfg.OUTPUT_DIR, "aggregation_results",f'{cfg.SERIES_TYPE}_{cfg.SERIES_ID}_full.html'))
+
+        return styled_table
+    else:
+        raise ValueError("unsupported metric_mode")
 
     return pivot_table.style.apply(highlight_min, axis=1).format("{:.4f}")
